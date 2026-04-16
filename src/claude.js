@@ -55,6 +55,7 @@ setInterval(() => {
 function resolveModel(modelId) {
     const modelMap = {
         'claude-opus-latest':    process.env.OPUS_MODEL   || 'opus',
+        'claude-opus-4-7':       process.env.OPUS_47_MODEL || 'claude-opus-4-7',
         'claude-sonnet-latest':  process.env.SONNET_MODEL || 'sonnet',
         'claude-haiku-latest':   process.env.HAIKU_MODEL  || 'haiku',
     };

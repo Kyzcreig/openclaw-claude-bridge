@@ -355,6 +355,7 @@ app.get('/v1/models', (req, res) => {
         object: 'list',
         data: [
             { id: 'claude-opus-latest',   object: 'model', created: 1700000000, owned_by: 'anthropic' },
+            { id: 'claude-opus-4-7',      object: 'model', created: 1700000000, owned_by: 'anthropic' },
             { id: 'claude-sonnet-latest', object: 'model', created: 1700000000, owned_by: 'anthropic' },
             { id: 'claude-haiku-latest',  object: 'model', created: 1700000000, owned_by: 'anthropic' },
         ],
@@ -972,6 +973,7 @@ statusApp.get('/status', (req, res) => {
         })),
         contextWindows: {
             'claude-opus-latest': getContextWindow('claude-opus-latest'),
+            'claude-opus-4-7': getContextWindow('claude-opus-4-7'),
             'claude-sonnet-latest': getContextWindow('claude-sonnet-latest'),
             'claude-haiku-latest': getContextWindow('claude-haiku-latest'),
         },

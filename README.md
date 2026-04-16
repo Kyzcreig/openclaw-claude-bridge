@@ -147,7 +147,8 @@ For detailed architecture of the dashboard, see [docs/architecture.md](docs/arch
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DASHBOARD_PASS` | No | — | Dashboard password (Basic Auth, user: `admin`) |
-| `OPUS_MODEL` | No | `opus` | CLI model alias for Opus (use `opus[1m]` for 1M context) |
+| `OPUS_MODEL` | No | `opus` | CLI model alias for Opus latest (use `opus[1m]` for 1M context) |
+| `OPUS_47_MODEL` | No | `claude-opus-4-7` | Exact Claude Opus 4.7 override for the explicit `claude-opus-4-7` model id |
 | `SONNET_MODEL` | No | `sonnet` | CLI model alias for Sonnet (use `sonnet[1m]` for 1M context) |
 | `HAIKU_MODEL` | No | `haiku` | CLI model alias for Haiku |
 | `IDLE_TIMEOUT_MS` | No | `120000` | Kill CLI subprocess after this many ms of no output |
@@ -181,7 +182,14 @@ Add this provider to your OpenClaw config (`~/.openclaw/openclaw.json`):
         "models": [
           {
             "id": "claude-opus-latest",
-            "name": "Claude Opus",
+            "name": "Claude Opus Latest",
+            "contextWindow": 1000000,
+            "maxTokens": 128000,
+            "reasoning": true
+          },
+          {
+            "id": "claude-opus-4-7",
+            "name": "Claude Opus 4.7",
             "contextWindow": 1000000,
             "maxTokens": 128000,
             "reasoning": true

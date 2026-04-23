@@ -482,29 +482,8 @@ app.post('/v1/chat/completions', async (req, res) => {
             });
         }
 
-        // OC /new startup interception: first request of /new has no metadata, just marker + startup prompt.
-        // Skip creating a CLI session — the real request (with metadata) follows immediately after.
-        if (messages.length <= 4 && !extractConversationLabel(messages) &&
-            messages.some(m => {
-                const c = typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join('') : '';
-                return c.includes('New session started');
-            })) {
-            const nsAgent = extractAgentName(messages);
-            logEntry.agent = nsAgent || null;
-            console.log(`[${requestId}] OC /new startup intercepted (${messages.length} msgs, agent="${nsAgent}"), returning NO_REPLY`);
-            logEntry.status = 'ok';
-            logEntry.resumeMethod = 'newstart';
-            logEntry.promptLen = 0;
-            logEntry.durationMs = Date.now() - startTime;
-            return res.json({
-                id: `chatcmpl-${requestId}`,
-                object: 'chat.completion',
-                created: Math.floor(Date.now() / 1000),
-                model,
-                choices: [{ index: 0, message: { role: 'assistant', content: 'NO_REPLY' }, finish_reason: 'stop' }],
-                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            });
-        }
+        // OC /new startup requests now surface user-visible failures if we return a synthetic
+        // empty stop payload here. Let them flow through to Claude so Forge gets a real first turn.
 
         // --- Session reuse detection ---
         gcMemory();

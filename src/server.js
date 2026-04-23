@@ -275,6 +275,60 @@ loadState();
 function parseToolCalls(text) {
     const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
     const calls = [];
+
+    function normalizeJsonish(text) {
+        let out = '';
+        let inString = false;
+        let escape = false;
+        for (const ch of text) {
+            if (escape) {
+                out += ch;
+                escape = false;
+                continue;
+            }
+            if (ch === '\\') {
+                out += ch;
+                escape = true;
+                continue;
+            }
+            if (ch === '"') {
+                out += ch;
+                inString = !inString;
+                continue;
+            }
+            if (inString) {
+                if (ch === '\n') {
+                    out += '\\n';
+                    continue;
+                }
+                if (ch === '\r') {
+                    out += '\\r';
+                    continue;
+                }
+                if (ch === '\t') {
+                    out += '\\t';
+                    continue;
+                }
+            }
+            out += ch;
+        }
+        return out;
+    }
+
+    function parseLooseJson(jsonText) {
+        try {
+            return { parsed: JSON.parse(jsonText), recovered: false };
+        } catch (firstErr) {
+            const normalized = normalizeJsonish(jsonText);
+            if (normalized !== jsonText) {
+                try {
+                    return { parsed: JSON.parse(normalized), recovered: true };
+                } catch {}
+            }
+            throw firstErr;
+        }
+    }
+
     let match;
     while ((match = regex.exec(text)) !== null) {
         const raw = (match[1] || '').trim();
@@ -286,10 +340,13 @@ function parseToolCalls(text) {
         }
         const jsonText = raw.slice(start, end + 1);
         try {
-            const parsed = JSON.parse(jsonText);
+            const { parsed, recovered } = parseLooseJson(jsonText);
             if (!parsed || typeof parsed.name !== 'string') {
                 console.error(`[parseToolCalls] Invalid tool_call payload: ${jsonText.slice(0, 300)}`);
                 continue;
+            }
+            if (recovered) {
+                console.warn(`[parseToolCalls] Recovered malformed tool_call JSON for ${parsed.name}`);
             }
             const args = (parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments))
                 ? parsed.arguments
@@ -304,22 +361,6 @@ function parseToolCalls(text) {
         }
     }
     return calls;
-}
-
-function getAvailableToolNames(tools) {
-    if (!Array.isArray(tools)) return [];
-    return tools.map(tool => tool?.function?.name || tool?.name).filter(Boolean);
-}
-
-function filterToolCalls(toolCalls, availableToolNames) {
-    const allowed = new Set(availableToolNames || []);
-    const valid = [];
-    const invalid = [];
-    for (const call of toolCalls || []) {
-        if (allowed.has(call.name)) valid.push(call);
-        else invalid.push(call);
-    }
-    return { valid, invalid };
 }
 
 /**
@@ -711,29 +752,47 @@ app.post('/v1/chat/completions', async (req, res) => {
         try {
             ({ text: finalText, usage: finalUsage } = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, isResume));
         } catch (err) {
+            const errMessage = err?.message || 'Unknown Claude error';
+            const emptyCompletion = /empty response/i.test(errMessage);
+            const terminatedCompletion = /(^|\b)terminated(\b|$)/i.test(errMessage);
+            const retryableFreshFailure = emptyCompletion || terminatedCompletion;
+            const wasResume = isResume;
+
             // OC disconnected (timeout/restart) — not a CLI error, preserve session
-            if (isResume && err.message === 'Client disconnected') {
+            if (wasResume && errMessage === 'Client disconnected') {
                 console.log(`[${requestId}] OC disconnected, preserving session=${sessionId.slice(0, 8)}`);
                 logEntry.status = 'oc_disconnect';
-                logEntry.error = err.message;
+                logEntry.error = errMessage;
                 logEntry.durationMs = Date.now() - startTime;
                 return;
             }
-            // CLI failed (context overflow, crash, etc.) — retry with compact history
-            if (isResume) {
-                console.warn(`[${requestId}] CLI failed (${err.message}), retrying with compact refresh`);
-                pushActivity(requestId, `⚠ CLI failed, retrying with compact refresh`);
-                logEntry.activity.push(`⚠ CLI failed: ${err.message}`);
+
+            // Retry resume failures with compact refresh, and retry empty/terminated
+            // fresh-session failures once from a new Claude session.
+            if (wasResume || retryableFreshFailure) {
+                const retryLabel = wasResume ? 'compact refresh' : 'fresh session retry';
+                if (retryableFreshFailure) {
+                    const breadcrumb = terminatedCompletion ? '⚠ terminated_completion_retry' : '⚠ empty_completion_retry';
+                    const breadcrumbLog = terminatedCompletion ? 'terminated_completion_retry' : 'empty_completion_retry';
+                    console.warn(`[${requestId}] ${breadcrumbLog}: ${errMessage}`);
+                    pushActivity(requestId, breadcrumb);
+                    logEntry.activity.push(breadcrumb);
+                }
+                console.warn(`[${requestId}] Claude failed (${errMessage}), retrying with ${retryLabel}`);
+                pushActivity(requestId, `⚠ Claude failed, retrying with ${retryLabel}`);
+                logEntry.activity.push(`⚠ Claude failed: ${errMessage}`);
                 isResume = false;
                 sessionId = uuidv4();
-                logEntry.resumeMethod = 'refresh';
-                const compactResult = convertMessagesCompact(messages);
-                promptText = compactResult.promptText;
-                if (compactResult.systemPrompt) {
-                    combinedSystemPrompt = `${compactResult.systemPrompt}${toolInstructions}`;
+                logEntry.resumeMethod = wasResume ? 'refresh' : (terminatedCompletion ? 'retry_terminated' : 'retry_empty');
+                if (wasResume) {
+                    const compactResult = convertMessagesCompact(messages);
+                    promptText = compactResult.promptText;
+                    if (compactResult.systemPrompt) {
+                        combinedSystemPrompt = `${compactResult.systemPrompt}${toolInstructions}`;
+                    }
                 }
                 logEntry.promptLen = promptText.length;
-                console.log(`[${requestId}] Compact refresh: new session=${sessionId.slice(0, 8)} promptLen=${promptText.length}`);
+                console.log(`[${requestId}] Retry path: new session=${sessionId.slice(0, 8)} promptLen=${promptText.length}`);
                 try {
                     ({ text: finalText, usage: finalUsage } = await runClaude(combinedSystemPrompt, promptText, model, onChunk, ac.signal, reasoning_effort, sessionId, false));
                 } catch (retryErr) {
@@ -751,16 +810,16 @@ app.post('/v1/chat/completions', async (req, res) => {
                     return;
                 }
             } else {
-                console.error(`[${requestId}] Claude error: ${err.message}`);
+                console.error(`[${requestId}] Claude error: ${errMessage}`);
                 logEntry.status = 'error';
-                logEntry.error = err.message;
+                logEntry.error = errMessage;
                 if (isStream) {
-                    sendChunk(`\n\n[Error: ${err.message}]`);
+                    sendChunk(`\n\n[Error: ${errMessage}]`);
                     sendChunk('', 'stop');
                     res.write('data: [DONE]\n\n');
                     res.end();
                 } else {
-                    res.status(500).json({ error: { message: err.message, type: 'internal_error' } });
+                    res.status(500).json({ error: { message: errMessage, type: 'internal_error' } });
                 }
                 return;
             }
@@ -784,14 +843,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         };
 
         // Parse <tool_call> blocks from Claude's response
-        const parsedToolCalls = parseToolCalls(finalText || '');
-        const availableToolNames = getAvailableToolNames(tools);
-        const { valid: toolCalls, invalid: invalidToolCalls } = filterToolCalls(parsedToolCalls, availableToolNames);
-        if (invalidToolCalls.length > 0) {
-            console.warn(`[${requestId}] filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
-            pushActivity(requestId, `filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
-            logEntry.activity.push(`filtered unavailable tool_calls: [${invalidToolCalls.map(tc => tc.name).join(', ')}]`);
-        }
+        const toolCalls = parseToolCalls(finalText || '');
 
         if (toolCalls.length > 0) {
             // Claude requested tools → return as OpenAI tool_calls for OC to execute

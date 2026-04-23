@@ -63,12 +63,7 @@ function resolveModel(modelId) {
 /** Context window size per model, derived from the resolved CLI model name. */
 function getContextWindow(modelId) {
     const resolved = resolveModel(modelId);
-    return (
-        modelId === 'claude-opus-4-7' ||
-        modelId === 'claude-opus-4-6' ||
-        modelId === 'claude-sonnet-4-6' ||
-        resolved.includes('[1m]')
-    ) ? 1_000_000 : 200_000;
+    return resolved.includes('[1m]') ? 1_000_000 : 200_000;
 }
 
 /**
@@ -107,6 +102,7 @@ function mapEffort(reasoningEffort) {
 const SCRUB_PATTERNS = [
     /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g,   // SCREAMING_SNAKE_CASE (2+ segments)
     /\[\[\s*(\w+)\s*\]\]/g,                    // [[bracket_tags]]
+    /\bsessions_[a-z_]+\b/g,                   // sessions_* tool names
 ];
 
 const SCRUB_WHITELIST = new Set([
@@ -301,6 +297,7 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
         let fullText = '';
         let fullUsage = { input_tokens: 0, output_tokens: 0 };
         let buffer = '';
+        let stderrText = '';
 
         proc.stdout.on('data', (chunk) => {
             resetIdle(); // Claude is alive — reset idle timer
@@ -323,7 +320,10 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
 
         proc.stderr.on('data', (data) => {
             const msg = data.toString().trim();
-            if (msg) console.error(`[claude stderr] ${msg}`);
+            if (msg) {
+                stderrText += (stderrText ? '\n' : '') + msg;
+                console.error(`[claude stderr] ${msg}`);
+            }
         });
 
         proc.on('close', (code) => {
@@ -340,8 +340,13 @@ function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoning
                 } catch {}
             }
 
-            if (code !== 0 && !fullText) {
-                reject(new Error(`Claude exited with code ${code}`));
+            const text = typeof fullText === 'string' ? fullText.trim() : '';
+            const detail = stderrText ? `: ${stderrText.split('\n').slice(-3).join(' | ')}` : '';
+
+            if (code !== 0 && !text) {
+                reject(new Error(`Claude exited with code ${code}${detail}`));
+            } else if (!text && (fullUsage.output_tokens ?? 0) === 0) {
+                reject(new Error(`Claude returned empty response${detail}`));
             } else {
                 // Inbound: restore aliases → original tokens
                 if (fullText) {

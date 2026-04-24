@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const { convertMessages, convertMessagesCompact, extractNewMessages, extractNewUserMessages } = require('./convert');
 const { buildToolInstructions } = require('./tools');
 const { runClaude, getContextWindow, clearSessionAlias } = require('./claude');
+const { cleanResponseText, parseToolCallsDetailed } = require('./tool-parser');
 
 // --- Session cleanup ---
 // Claude CLI subprocess runs with cwd=/tmp. On macOS /tmp → /private/tmp,
@@ -268,120 +269,7 @@ function pushActivity(requestId, msg) {
 // Load persisted state (channelMap, responseMap, requestLog, stats, globalActivity)
 loadState();
 
-/**
- * Parse <tool_call> blocks from Claude's response text.
- * Returns array of { id, name, arguments } or empty array.
- */
-function parseToolCalls(text) {
-    const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-    const calls = [];
-
-    function normalizeJsonish(text) {
-        let out = '';
-        let inString = false;
-        let escape = false;
-        for (const ch of text) {
-            if (escape) {
-                out += ch;
-                escape = false;
-                continue;
-            }
-            if (ch === '\\') {
-                out += ch;
-                escape = true;
-                continue;
-            }
-            if (ch === '"') {
-                out += ch;
-                inString = !inString;
-                continue;
-            }
-            if (inString) {
-                if (ch === '\n') {
-                    out += '\\n';
-                    continue;
-                }
-                if (ch === '\r') {
-                    out += '\\r';
-                    continue;
-                }
-                if (ch === '\t') {
-                    out += '\\t';
-                    continue;
-                }
-            }
-            out += ch;
-        }
-        return out;
-    }
-
-    function parseLooseJson(jsonText) {
-        try {
-            return { parsed: JSON.parse(jsonText), recovered: false };
-        } catch (firstErr) {
-            const normalized = normalizeJsonish(jsonText);
-            if (normalized !== jsonText) {
-                try {
-                    return { parsed: JSON.parse(normalized), recovered: true };
-                } catch {}
-            }
-            throw firstErr;
-        }
-    }
-
-    let match;
-    while ((match = regex.exec(text)) !== null) {
-        const raw = (match[1] || '').trim();
-        const start = raw.indexOf('{');
-        const end = raw.lastIndexOf('}');
-        if (start === -1 || end === -1 || end < start) {
-            console.error(`[parseToolCalls] No JSON object found in block: ${raw.slice(0, 300)}`);
-            continue;
-        }
-        const jsonText = raw.slice(start, end + 1);
-        try {
-            const { parsed, recovered } = parseLooseJson(jsonText);
-            if (!parsed || typeof parsed.name !== 'string') {
-                console.error(`[parseToolCalls] Invalid tool_call payload: ${jsonText.slice(0, 300)}`);
-                continue;
-            }
-            if (recovered) {
-                console.warn(`[parseToolCalls] Recovered malformed tool_call JSON for ${parsed.name}`);
-            }
-            const args = (parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments))
-                ? parsed.arguments
-                : {};
-            calls.push({
-                id: `call_${uuidv4().slice(0, 8)}`,
-                name: parsed.name,
-                arguments: args,
-            });
-        } catch (err) {
-            console.error(`[parseToolCalls] Failed to parse JSON: ${jsonText.slice(0, 300)}`);
-        }
-    }
-    return calls;
-}
-
-/**
- * Strip internal XML tags that Claude may echo back from conversation context.
- * These are meant for Claude's consumption, not the end user.
- */
-function cleanResponseText(text) {
-    if (!text) return text;
-    const stripped = text
-        .replace(/<tool_thinking>[\s\S]*?<\/tool_thinking>/g, '')
-        .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
-        .replace(/<tool_result[\s\S]*?<\/tool_result>/g, '')
-        .replace(/<previous_response>[\s\S]*?<\/previous_response>/g, '');
-    // Collapse 3+ newlines only OUTSIDE fenced code blocks, to preserve
-    // intentional formatting inside triple-backtick fences.
-    const parts = stripped.split(/(```[\s\S]*?```)/);
-    return parts
-        .map((part, idx) => idx % 2 === 0 ? part.replace(/\n{3,}/g, '\n\n') : part)
-        .join('')
-        .trim();
-}
+// Tool-call parsing and internal bridge markup cleanup live in ./tool-parser.
 
 // ─── API app (port 3456, localhost only) ──────────────────────────────────────
 const app = express();
@@ -454,8 +342,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         logEntry.thinking = !!reasoning_effort;
         if (reasoning_effort) console.log(`[${requestId}] reasoning_effort=${reasoning_effort}`);
 
+        const allowedToolNames = new Set(tools.map(t => t.function?.name || t.name).filter(Boolean));
         if (tools.length > 0) {
-            const toolNames = tools.map(t => t.function?.name || t.name).filter(Boolean);
+            const toolNames = Array.from(allowedToolNames);
             console.log(`[${requestId}] tools:[${toolNames.join(',')}]`);
         }
 
@@ -821,8 +710,18 @@ app.post('/v1/chat/completions', async (req, res) => {
             },
         };
 
-        // Parse <tool_call> blocks from Claude's response
-        const toolCalls = parseToolCalls(finalText || '');
+        // Parse <tool_call> blocks from Claude's response. Exact XML is preferred;
+        // one unambiguous malformed block can be repaired, but only for declared tools.
+        const toolCallResult = parseToolCallsDetailed(finalText || '', { allowedToolNames });
+        const toolCalls = toolCallResult.calls;
+        if (toolCallResult.repaired) {
+            console.warn(`[${requestId}] WARNING malformed_tool_call_repaired close=${toolCallResult.closeTag || 'unknown'} tool=${toolCalls[0]?.name || 'unknown'}`);
+        } else if (toolCallResult.hadToolCallMarkup && toolCalls.length === 0) {
+            console.warn(`[${requestId}] WARNING malformed_tool_call_unrecoverable reason=${toolCallResult.malformedReason || 'unknown'}`);
+        }
+        if (toolCallResult.recoveredJson) {
+            console.warn(`[${requestId}] WARNING malformed_tool_call_json_recovered`);
+        }
 
         if (toolCalls.length > 0) {
             // Claude requested tools → return as OpenAI tool_calls for OC to execute

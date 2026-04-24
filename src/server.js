@@ -7,7 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const { convertMessages, convertMessagesCompact, extractNewMessages, extractNewUserMessages } = require('./convert');
 const { buildToolInstructions } = require('./tools');
 const { runClaude, getContextWindow, clearSessionAlias } = require('./claude');
-const { cleanResponseText, parseToolCallsDetailed } = require('./tool-parser');
+const { cleanResponseText, hasInternalBridgeMarkup, parseToolCallsDetailed, redactSensitivePreview } = require('./tool-parser');
 
 // --- Session cleanup ---
 // Claude CLI subprocess runs with cwd=/tmp. On macOS /tmp → /private/tmp,
@@ -717,11 +717,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (toolCallResult.repaired) {
             console.warn(`[${requestId}] WARNING malformed_tool_call_repaired close=${toolCallResult.closeTag || 'unknown'} tool=${toolCalls[0]?.name || 'unknown'}`);
         } else if (toolCallResult.hadToolCallMarkup && toolCalls.length === 0) {
-            console.warn(`[${requestId}] WARNING malformed_tool_call_unrecoverable reason=${toolCallResult.malformedReason || 'unknown'}`);
+            console.warn(`[${requestId}] WARNING malformed_tool_call_unrecoverable reason=${toolCallResult.malformedReason || 'unknown'} preview=${redactSensitivePreview(finalText || '')}`);
         }
         if (toolCallResult.recoveredJson) {
             console.warn(`[${requestId}] WARNING malformed_tool_call_json_recovered`);
         }
+
+        const rawMarkupPresent = hasInternalBridgeMarkup(finalText || '');
 
         if (toolCalls.length > 0) {
             // Claude requested tools → return as OpenAI tool_calls for OC to execute
@@ -788,8 +790,13 @@ app.post('/v1/chat/completions', async (req, res) => {
                 });
             }
         } else {
-            // No tool calls — return clean text with finish_reason: stop
-            const cleanText = cleanResponseText(finalText);
+            // No tool calls — return clean text with finish_reason: stop.
+            // Fail closed if raw bridge markup somehow survives parsing.
+            let cleanText = cleanResponseText(finalText);
+            if (rawMarkupPresent) {
+                console.warn(`[${requestId}] WARNING suppressed_internal_bridge_markup preview=${redactSensitivePreview(finalText || '')}`);
+                cleanText = '';
+            }
             if (cleanText) sendChunk(cleanText);
 
             if (isStream) {

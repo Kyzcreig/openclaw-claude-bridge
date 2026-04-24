@@ -187,6 +187,21 @@ function parseToolCalls(text, allowedToolNames) {
     return parseToolCallsDetailed(text, { allowedToolNames }).calls;
 }
 
+function hasInternalBridgeMarkup(text) {
+    if (!text) return false;
+    return /<(?:tool_call|tool_result|tool_thinking|previous_response)\b|<\/(?:tool_call|tool_char|tool_result|tool_thinking|previous_response)>/i.test(String(text));
+}
+
+function redactSensitivePreview(text, maxLen = 400) {
+    if (!text) return '';
+    return String(text)
+        .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, 'sk-***')
+        .replace(/\b(OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|DEEPSEEK_API_KEY)\b\s*[:=]\s*[^\s"']+/gi, '$1=***')
+        .replace(/\b(token|api[_-]?key|secret|password)\b\s*[:=]\s*[^\s,}\]"']+/gi, '$1=***')
+        .slice(0, maxLen)
+        .replace(/\n/g, '\\n');
+}
+
 function cleanResponseText(text) {
     if (!text) return text;
     const stripped = String(text)
@@ -210,6 +225,8 @@ function cleanResponseText(text) {
 module.exports = {
     cleanResponseText,
     extractBalancedJsonObjects,
+    hasInternalBridgeMarkup,
     parseToolCalls,
     parseToolCallsDetailed,
+    redactSensitivePreview,
 };

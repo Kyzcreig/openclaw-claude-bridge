@@ -2,6 +2,20 @@
 
 const { classifyParts, AttachmentBudgetError } = require('./attachments');
 
+// Sentinel markers that delimit regions of promptText which must NOT be scrubbed.
+// Tool-call JSON arguments and tool-result payloads contain literal data (file
+// paths, command output, identifiers) that the orchestrator owns — scrubbing
+// them corrupts on-disk reality. We wrap those regions on the way out and strip
+// the markers in claude.js after a scope-aware scrub pass.
+// Markers are constructed from char codes so they themselves can never be
+// substituted by the scrubber.
+const NOSCRUB_OPEN  = String.fromCharCode(0x1E) + 'NOSCRUB' + String.fromCharCode(0x1F);
+const NOSCRUB_CLOSE = String.fromCharCode(0x1F) + 'NOSCRUB' + String.fromCharCode(0x1E);
+function noscrub(text) {
+    return NOSCRUB_OPEN + text + NOSCRUB_CLOSE;
+}
+
+
 /**
  * Convert an OpenAI messages array into the bridge's internal shape.
  *
@@ -64,7 +78,7 @@ function convertMessages(messages, opts = {}) {
             if (Array.isArray(msg.tool_calls)) {
                 for (const tc of msg.tool_calls) {
                     const fn = tc.function || {};
-                    parts.push(`<tool_call>\n{"name": "${fn.name}", "arguments": ${fn.arguments || '{}'}}\n</tool_call>`);
+                    parts.push(noscrub(`<tool_call>\n{"name": "${fn.name}", "arguments": ${fn.arguments || '{}'}}\n</tool_call>`));
                 }
             }
 
@@ -77,7 +91,7 @@ function convertMessages(messages, opts = {}) {
             const toolId = msg.tool_call_id || '';
             const text = _classifyToText(msg.content, turnId);
             if (text) {
-                conversationParts.push(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`);
+                conversationParts.push(noscrub(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`));
             }
         }
     }
@@ -168,7 +182,7 @@ function extractNewMessages(messages, opts = {}) {
             let { text } = _classify(msg.content, turnId);
             if (text) {
                 if (text.length > toolResultCap) text = text.slice(0, toolResultCap) + '\n[... truncated]';
-                parts.push(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`);
+                parts.push(noscrub(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`));
             }
         } else if (msg.role === 'user') {
             const { text, attachments } = _classify(msg.content, turnId);
@@ -222,7 +236,7 @@ function extractNewUserMessages(messages, opts = {}) {
             let { text } = _classify(msg.content, turnId);
             if (text) {
                 if (text.length > toolResultCap) text = text.slice(0, toolResultCap) + '\n[... truncated]';
-                parts.push(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`);
+                parts.push(noscrub(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${text}\n</tool_result>`));
             }
         }
     }
@@ -284,7 +298,7 @@ function convertMessagesCompact(messages, opts = {}) {
             if (Array.isArray(msg.tool_calls)) {
                 for (const tc of msg.tool_calls) {
                     const fn = tc.function || {};
-                    parts.push(`<tool_call>\n{"name": "${fn.name}", "arguments": ${fn.arguments || '{}'}}\n</tool_call>`);
+                    parts.push(noscrub(`<tool_call>\n{"name": "${fn.name}", "arguments": ${fn.arguments || '{}'}}\n</tool_call>`));
                 }
             }
             if (parts.length > 0) {
@@ -297,7 +311,7 @@ function convertMessagesCompact(messages, opts = {}) {
             if (text) {
                 const cap = currentUserTurn >= recentCutoff ? recentToolCap : oldToolCap;
                 const truncated = text.length > cap ? text.slice(0, cap) + '\n[... truncated]' : text;
-                conversationParts.push(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${truncated}\n</tool_result>`);
+                conversationParts.push(noscrub(`<tool_result name="${toolName}" tool_call_id="${toolId}">\n${truncated}\n</tool_result>`));
             }
         }
     }
@@ -309,4 +323,4 @@ function convertMessagesCompact(messages, opts = {}) {
     };
 }
 
-module.exports = { convertMessages, convertMessagesCompact, extractNewMessages, extractNewUserMessages, extractContent };
+module.exports = { convertMessages, convertMessagesCompact, extractNewMessages, extractNewUserMessages, extractContent, NOSCRUB_OPEN, NOSCRUB_CLOSE };

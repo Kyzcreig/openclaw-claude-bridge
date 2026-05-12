@@ -2,6 +2,7 @@
 
 const { spawn } = require('child_process');
 const crypto = require('crypto');
+const { NOSCRUB_OPEN, NOSCRUB_CLOSE } = require('./convert');
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
@@ -199,15 +200,60 @@ function restoreInbound(text, alias, aliasLower, sessionId) {
     return text;
 }
 
+
+/**
+ * Apply brand substitution (OpenClaw -> alias, openclaw -> aliasLower) to all
+ * regions of `text` EXCEPT those wrapped in NOSCRUB_OPEN/NOSCRUB_CLOSE
+ * sentinels. Sentinels are stripped from the returned string.
+ *
+ * Used so tool_call JSON args and tool_result payloads — which contain
+ * literal on-disk data the orchestrator owns (file paths, command output,
+ * identifiers) — pass through to Claude verbatim while surrounding
+ * user/assistant prose still gets brand-substituted.
+ *
+ * Preserves the prior `promptText` scope: brand-only, no pattern token
+ * scrubbing. systemPrompt continues to go through the heavier scrubOutbound.
+ */
+function brandSubstituteWithSkipRegions(text, alias, aliasLower) {
+    if (!text) return text;
+    const apply = (chunk) => chunk
+        .replace(/OpenClaw/g, alias)
+        .replace(/openclaw/g, aliasLower);
+    if (!text.includes(NOSCRUB_OPEN)) {
+        return apply(text);
+    }
+    const out = [];
+    let i = 0;
+    while (i < text.length) {
+        const openIdx = text.indexOf(NOSCRUB_OPEN, i);
+        if (openIdx === -1) {
+            out.push(apply(text.slice(i)));
+            break;
+        }
+        if (openIdx > i) {
+            out.push(apply(text.slice(i, openIdx)));
+        }
+        const closeIdx = text.indexOf(NOSCRUB_CLOSE, openIdx + NOSCRUB_OPEN.length);
+        if (closeIdx === -1) {
+            // Malformed sentinel pair — fail safe by brand-substituting the
+            // rest with the open marker stripped, so brand strings never leak
+            // unsubstituted when the structure is broken.
+            out.push(apply(text.slice(openIdx + NOSCRUB_OPEN.length)));
+            break;
+        }
+        out.push(text.slice(openIdx + NOSCRUB_OPEN.length, closeIdx));
+        i = closeIdx + NOSCRUB_CLOSE.length;
+    }
+    return out.join('');
+}
+
 function runClaude(systemPrompt, promptText, modelId, onChunk, signal, reasoningEffort, sessionId, isResume, attachmentBlocks) {
     // Stable alias per session — see getSessionAlias() above.
     const { alias, aliasLower } = getSessionAlias(sessionId);
     if (systemPrompt) {
         systemPrompt = scrubOutbound(systemPrompt, alias, aliasLower, sessionId);
     }
-    promptText = promptText
-        .replace(/OpenClaw/g, alias)
-        .replace(/openclaw/g, aliasLower);
+    promptText = brandSubstituteWithSkipRegions(promptText, alias, aliasLower);
 
     return new Promise((resolve, reject) => {
         const model = resolveModel(modelId);
